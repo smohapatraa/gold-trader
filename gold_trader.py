@@ -183,9 +183,16 @@ def delete_sell(sell_id):
 # ------------------------------------------------------------
 # PORTFOLIO CALCULATION — FIFO COST BASIS
 # ------------------------------------------------------------
-def compute_portfolio(buys_df, sells_df):
+def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
     """
-    FIFO cost basis for realized profit + remaining lots.
+    Compute per-lot profitability with SEPARATE Realized and Unrealized columns.
+
+    Returns a DataFrame with:
+    - Original shares, sold shares, remaining shares
+    - Realized profit (booked from sells FIFO)
+    - Unrealized P&L (paper profit on remaining shares at current price)
+    - Total P&L = Realized + Unrealized
+    - Target price (20% hike) and target profit
     """
     buys = buys_df.copy()
     sells = sells_df.copy()
@@ -193,27 +200,24 @@ def compute_portfolio(buys_df, sells_df):
     if not buys.empty:
         buys['buy_date'] = pd.to_datetime(buys['buy_date'], errors='coerce', dayfirst=True)
         buys = buys.sort_values('buy_date').reset_index(drop=True)
-
     if not sells.empty:
         sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
         sells = sells.sort_values('sell_date').reset_index(drop=True)
 
+    # Build lot tracker
     lots = []
     for _, row in buys.iterrows():
         lots.append({
             'id': int(row['id']),
-            'shares': int(row['shares']),
-            'price': float(row['price']),
             'date': row['buy_date'],
+            'orig_shares': int(row['shares']),
+            'remaining_shares': int(row['shares']),
+            'price': float(row['price']),
+            'realized_profit': 0.0,
+            'sold_shares': 0,
         })
 
-    total_bought_shares = sum(lot['shares'] for lot in lots)
-    lifetime_invested = sum(lot['shares'] * lot['price'] for lot in lots)
-
-    realized_profit = 0.0
-    total_sold_proceeds = 0.0
-    total_sold_shares = 0
-
+    # Consume lots FIFO, tracking realized profit per lot
     for _, sell_row in sells.iterrows():
         sell_shares = int(sell_row['shares'])
         sell_price = float(sell_row['price'])
@@ -221,33 +225,63 @@ def compute_portfolio(buys_df, sells_df):
 
         while remaining > 0 and lots:
             lot = lots[0]
-            if lot['shares'] <= remaining:
-                realized_profit += lot['shares'] * (sell_price - lot['price'])
-                remaining -= lot['shares']
+            if lot['remaining_shares'] <= remaining:
+                profit = lot['remaining_shares'] * (sell_price - lot['price'])
+                lot['realized_profit'] += profit
+                lot['sold_shares'] += lot['remaining_shares']
+                remaining -= lot['remaining_shares']
+                lot['remaining_shares'] = 0
                 lots.pop(0)
             else:
-                realized_profit += remaining * (sell_price - lot['price'])
-                lot['shares'] -= remaining
+                profit = remaining * (sell_price - lot['price'])
+                lot['realized_profit'] += profit
+                lot['sold_shares'] += remaining
+                lot['remaining_shares'] -= remaining
                 remaining = 0
 
-        total_sold_proceeds += sell_shares * sell_price
-        total_sold_shares += sell_shares
+    # Build final table
+    rows = []
+    for lot in lots:
+        cost_total = lot['orig_shares'] * lot['price']
+        cost_remaining = lot['remaining_shares'] * lot['price']
 
-    net_shares = sum(lot['shares'] for lot in lots)
-    remaining_cost = sum(lot['shares'] * lot['price'] for lot in lots)
-    avg_cost = (remaining_cost / net_shares) if net_shares > 0 else 0.0
+        realized = round(lot['realized_profit'], 2)
 
-    return {
-        'total_shares_bought': total_bought_shares,
-        'total_shares_sold': total_sold_shares,
-        'net_shares': net_shares,
-        'lifetime_invested': lifetime_invested,
-        'total_sold_amount': total_sold_proceeds,
-        'unsold_cost': remaining_cost,
-        'total_profit': realized_profit,
-        'avg_cost': avg_cost,
-    }
+        if current_price is not None and lot['remaining_shares'] > 0:
+            unrealized = round((current_price - lot['price']) * lot['remaining_shares'], 2)
+        else:
+            unrealized = 0.0
 
+        total_pnl = round(realized + unrealized, 2)
+
+        target_price = round(lot['price'] * (1 + profit_pct / 100), 2)
+        target_profit = round((target_price - lot['price']) * lot['remaining_shares'], 2)
+
+        if lot['remaining_shares'] == 0:
+            status = "✅ Fully Sold"
+        elif current_price is not None and current_price >= target_price:
+            status = "🎯 SELL NOW"
+        else:
+            status = "⏳ Holding"
+
+        rows.append({
+            "Lot ID": lot['id'],
+            "Buy Date": lot['date'].strftime('%d-%b-%Y'),
+            "Buy Price (₹)": round(lot['price'], 2),
+            "Orig Units": lot['orig_shares'],
+            "Sold Units": lot['sold_shares'],
+            "Remaining Units": lot['remaining_shares'],
+            "Total Cost (₹)": round(cost_total, 2),
+            "Remaining Cost (₹)": round(cost_remaining, 2),
+            "Realized Profit (₹)": realized,
+            "Unrealized P&L (₹)": unrealized,
+            "Total P&L (₹)": total_pnl,
+            "Target Price (₹)": target_price,
+            "Target Profit (₹)": target_profit,
+            "Status": status,
+        })
+
+    return pd.DataFrame(rows)
 
 # ------------------------------------------------------------
 # NEXT SELL LOT — 20% PROFIT, CHEAPEST FIRST
