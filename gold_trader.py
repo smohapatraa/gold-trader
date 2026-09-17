@@ -183,16 +183,129 @@ def delete_sell(sell_id):
 # ------------------------------------------------------------
 # PORTFOLIO CALCULATION — FIFO COST BASIS
 # ------------------------------------------------------------
+def compute_portfolio(buys_df, sells_df):
+    """
+    FIFO cost basis for realized profit + remaining lots.
+    """
+    buys = buys_df.copy()
+    sells = sells_df.copy()
+
+    if not buys.empty:
+        buys['buy_date'] = pd.to_datetime(buys['buy_date'], errors='coerce', dayfirst=True)
+        buys = buys.sort_values('buy_date').reset_index(drop=True)
+
+    if not sells.empty:
+        sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
+        sells = sells.sort_values('sell_date').reset_index(drop=True)
+
+    lots = []
+    for _, row in buys.iterrows():
+        lots.append({
+            'id': int(row['id']),
+            'shares': int(row['shares']),
+            'price': float(row['price']),
+            'date': row['buy_date'],
+        })
+
+    total_bought_shares = sum(lot['shares'] for lot in lots)
+    lifetime_invested = sum(lot['shares'] * lot['price'] for lot in lots)
+
+    realized_profit = 0.0
+    total_sold_proceeds = 0.0
+    total_sold_shares = 0
+
+    for _, sell_row in sells.iterrows():
+        sell_shares = int(sell_row['shares'])
+        sell_price = float(sell_row['price'])
+        remaining = sell_shares
+
+        while remaining > 0 and lots:
+            lot = lots[0]
+            if lot['shares'] <= remaining:
+                realized_profit += lot['shares'] * (sell_price - lot['price'])
+                remaining -= lot['shares']
+                lots.pop(0)
+            else:
+                realized_profit += remaining * (sell_price - lot['price'])
+                lot['shares'] -= remaining
+                remaining = 0
+
+        total_sold_proceeds += sell_shares * sell_price
+        total_sold_shares += sell_shares
+
+    net_shares = sum(lot['shares'] for lot in lots)
+    remaining_cost = sum(lot['shares'] * lot['price'] for lot in lots)
+    avg_cost = (remaining_cost / net_shares) if net_shares > 0 else 0.0
+
+    return {
+        'total_shares_bought': total_bought_shares,
+        'total_shares_sold': total_sold_shares,
+        'net_shares': net_shares,
+        'lifetime_invested': lifetime_invested,
+        'total_sold_amount': total_sold_proceeds,
+        'unsold_cost': remaining_cost,
+        'total_profit': realized_profit,
+        'avg_cost': avg_cost,
+    }
+
+
+# ------------------------------------------------------------
+# NEXT SELL LOT — 20% PROFIT, CHEAPEST FIRST
+# ------------------------------------------------------------
+def get_next_sell_lot(buys_df, sells_df, profit_pct=20):
+    """
+    Determine the next lot to sell:
+    - Get all unsold lots (after FIFO consumption of sells)
+    - Sort by BUY PRICE ascending (cheapest first)
+    - Each lot's target = buy_price × (1 + profit_pct/100)
+    """
+    buys = buys_df.copy()
+    sells = sells_df.copy()
+
+    if not buys.empty:
+        buys['buy_date'] = pd.to_datetime(buys['buy_date'], errors='coerce', dayfirst=True)
+    if not sells.empty:
+        sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
+
+    lots = []
+    for _, row in buys.sort_values('buy_date').iterrows():
+        lots.append({
+            'id': int(row['id']),
+            'date': row['buy_date'],
+            'shares': int(row['shares']),
+            'price': float(row['price']),
+        })
+
+    for _, sell_row in sells.sort_values('sell_date').iterrows():
+        sell_shares = int(sell_row['shares'])
+        remaining = sell_shares
+        while remaining > 0 and lots:
+            lot = lots[0]
+            if lot['shares'] <= remaining:
+                remaining -= lot['shares']
+                lots.pop(0)
+            else:
+                lot['shares'] -= remaining
+                remaining = 0
+
+    lots_sorted = sorted(lots, key=lambda x: x['price'])
+
+    for lot in lots_sorted:
+        lot['target_price'] = round(lot['price'] * (1 + profit_pct / 100), 2)
+        lot['target_value'] = round(lot['target_price'] * lot['shares'], 2)
+        lot['cost'] = round(lot['price'] * lot['shares'], 2)
+        lot['profit_at_target'] = round(lot['target_value'] - lot['cost'], 2)
+
+    next_lot = lots_sorted[0] if lots_sorted else None
+    return lots_sorted, next_lot
+
+
+# ------------------------------------------------------------
+# LOT-WISE P&L (Realized + Unrealized separated)
+# ------------------------------------------------------------
 def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
     """
     Compute per-lot profitability with SEPARATE Realized and Unrealized columns.
-
-    Returns a DataFrame with:
-    - Original shares, sold shares, remaining shares
-    - Realized profit (booked from sells FIFO)
-    - Unrealized P&L (paper profit on remaining shares at current price)
-    - Total P&L = Realized + Unrealized
-    - Target price (20% hike) and target profit
     """
     buys = buys_df.copy()
     sells = sells_df.copy()
@@ -204,7 +317,6 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
         sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
         sells = sells.sort_values('sell_date').reset_index(drop=True)
 
-    # Build lot tracker
     lots = []
     for _, row in buys.iterrows():
         lots.append({
@@ -217,7 +329,6 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
             'sold_shares': 0,
         })
 
-    # Consume lots FIFO, tracking realized profit per lot
     for _, sell_row in sells.iterrows():
         sell_shares = int(sell_row['shares'])
         sell_price = float(sell_row['price'])
@@ -239,12 +350,10 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
                 lot['remaining_shares'] -= remaining
                 remaining = 0
 
-    # Build final table
     rows = []
     for lot in lots:
         cost_total = lot['orig_shares'] * lot['price']
         cost_remaining = lot['remaining_shares'] * lot['price']
-
         realized = round(lot['realized_profit'], 2)
 
         if current_price is not None and lot['remaining_shares'] > 0:
@@ -253,7 +362,6 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
             unrealized = 0.0
 
         total_pnl = round(realized + unrealized, 2)
-
         target_price = round(lot['price'] * (1 + profit_pct / 100), 2)
         target_profit = round((target_price - lot['price']) * lot['remaining_shares'], 2)
 
@@ -282,61 +390,6 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
         })
 
     return pd.DataFrame(rows)
-
-# ------------------------------------------------------------
-# NEXT SELL LOT — 20% PROFIT, CHEAPEST FIRST
-# ------------------------------------------------------------
-def get_next_sell_lot(buys_df, sells_df, profit_pct=20):
-    """
-    Determine the next lot to sell:
-    - Get all unsold lots (after FIFO consumption of sells)
-    - Sort by BUY PRICE ascending (cheapest first)
-    - Each lot's target = buy_price × (1 + profit_pct/100)
-    - Return all lots with their targets + the next one to sell
-    """
-    buys = buys_df.copy()
-    sells = sells_df.copy()
-
-    if not buys.empty:
-        buys['buy_date'] = pd.to_datetime(buys['buy_date'], errors='coerce', dayfirst=True)
-    if not sells.empty:
-        sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
-
-    # Build FIFO lots
-    lots = []
-    for _, row in buys.sort_values('buy_date').iterrows():
-        lots.append({
-            'id': int(row['id']),
-            'date': row['buy_date'],
-            'shares': int(row['shares']),
-            'price': float(row['price']),
-        })
-
-    # Consume lots FIFO per sells
-    for _, sell_row in sells.sort_values('sell_date').iterrows():
-        sell_shares = int(sell_row['shares'])
-        remaining = sell_shares
-        while remaining > 0 and lots:
-            lot = lots[0]
-            if lot['shares'] <= remaining:
-                remaining -= lot['shares']
-                lots.pop(0)
-            else:
-                lot['shares'] -= remaining
-                remaining = 0
-
-    # Sort remaining lots by price (cheapest first)
-    lots_sorted = sorted(lots, key=lambda x: x['price'])
-
-    # Compute targets
-    for lot in lots_sorted:
-        lot['target_price'] = round(lot['price'] * (1 + profit_pct / 100), 2)
-        lot['target_value'] = round(lot['target_price'] * lot['shares'], 2)
-        lot['cost'] = round(lot['price'] * lot['shares'], 2)
-        lot['profit_at_target'] = round(lot['target_value'] - lot['cost'], 2)
-
-    next_lot = lots_sorted[0] if lots_sorted else None
-    return lots_sorted, next_lot
 
 
 # ------------------------------------------------------------
@@ -435,9 +488,9 @@ def predict_next_day_open(gold_df, inr_df, etf_df):
     return predictions
 
 
-# ------------------------------------------------------------
-# MAIN UI
-# ------------------------------------------------------------
+# ============================================================
+# MAIN UI — starts here
+# ============================================================
 st.title("🥇 Gold Trading Portfolio & Prediction Dashboard")
 st.caption(f"🕐 Live prices updated {_ist_now()} IST · Data stored in Google Sheets")
 
@@ -450,11 +503,14 @@ with col_r1:
 
 st.divider()
 
+# ----- Load data -----
 buys_df = load_buys()
 sells_df = load_sells()
 
+# ----- Compute portfolio -----
 portfolio = compute_portfolio(buys_df, sells_df)
 
+# ----- Fetch live prices -----
 with st.spinner("Fetching live gold prices..."):
     bundle = fetch_gold_data()
 
@@ -588,6 +644,119 @@ else:
     st.info("ℹ️ Live price unavailable — cannot compute distance to target.")
 
 # ------------------------------------------------------------
+# LOT-WISE PROFITABILITY TABLE
+# ------------------------------------------------------------
+st.divider()
+st.subheader("📋 Lot-Wise Profitability")
+st.caption("Realized (booked) · Unrealized (paper) · Total per lot")
+
+lot_pnl_df = compute_lot_wise_pnl(buys_df, sells_df, current_price, profit_pct=20)
+
+if not lot_pnl_df.empty:
+    total_realized = lot_pnl_df['Realized Profit (₹)'].sum()
+    total_unrealized = lot_pnl_df['Unrealized P&L (₹)'].sum()
+    total_pnl = lot_pnl_df['Total P&L (₹)'].sum()
+    total_target_profit = lot_pnl_df['Target Profit (₹)'].sum()
+    total_remaining_cost = lot_pnl_df['Remaining Cost (₹)'].sum()
+
+    col_lp1, col_lp2, col_lp3, col_lp4, col_lp5 = st.columns(5)
+
+    with col_lp1:
+        st.metric("💰 Realized Profit", f"₹{total_realized:,.2f}")
+
+    with col_lp2:
+        st.metric("📈 Unrealized P&L", f"₹{total_unrealized:,.2f}")
+
+    with col_lp3:
+        st.metric("🎯 Total P&L", f"₹{total_pnl:,.2f}")
+
+    with col_lp4:
+        st.metric("💼 Remaining Cost", f"₹{total_remaining_cost:,.2f}")
+
+    with col_lp5:
+        st.metric("🎯 Target Profit (20%)", f"₹{total_target_profit:,.2f}")
+
+    def color_pnl(val):
+        if isinstance(val, (int, float)):
+            if val > 0:
+                return 'color: #00ff88; font-weight: bold;'
+            elif val < 0:
+                return 'color: #ff6b6b; font-weight: bold;'
+        return 'color: #cccccc;'
+
+    styled_lot_df = lot_pnl_df.style.map(
+        color_pnl,
+        subset=['Realized Profit (₹)', 'Unrealized P&L (₹)', 'Total P&L (₹)']
+    )
+
+    st.dataframe(
+        styled_lot_df,
+        column_config={
+            "Buy Price (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Total Cost (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Remaining Cost (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Realized Profit (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Unrealized P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Total P&L (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Target Price (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+            "Target Profit (₹)": st.column_config.NumberColumn(format="₹%.2f"),
+        },
+        hide_index=True,
+        use_container_width=True,
+        height=500
+    )
+
+    csv_data = lot_pnl_df.to_csv(index=False).encode('utf-8')
+    st.download_button(
+        label="📥 Download Lot-Wise P&L (CSV)",
+        data=csv_data,
+        file_name=f"gold_lot_pnl_{_ist_today()}.csv",
+        mime='text/csv'
+    )
+
+    st.markdown("### 📊 Per-Lot P&L Breakdown")
+    chart_df = lot_pnl_df[lot_pnl_df['Orig Units'] > 0].copy()
+    if not chart_df.empty:
+        fig_lots = go.Figure()
+        fig_lots.add_trace(go.Bar(
+            x=chart_df['Lot ID'].astype(str),
+            y=chart_df['Realized Profit (₹)'],
+            name='Realized Profit',
+            marker_color='#00ff88'
+        ))
+        fig_lots.add_trace(go.Bar(
+            x=chart_df['Lot ID'].astype(str),
+            y=chart_df['Unrealized P&L (₹)'],
+            name='Unrealized P&L',
+            marker_color='#4facfe'
+        ))
+        fig_lots.update_layout(
+            title="Realized vs Unrealized P&L per Lot",
+            xaxis_title="Lot ID",
+            yaxis_title="P&L (₹)",
+            barmode='stack',
+            height=400,
+            margin=dict(l=10, r=10, t=50, b=10),
+            font=dict(size=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        st.plotly_chart(fig_lots, use_container_width=True,
+                        config={'displayModeBar': False, 'responsive': True})
+
+    st.markdown("### 📌 Lot Status Summary")
+    fully_sold = len(lot_pnl_df[lot_pnl_df['Status'] == "✅ Fully Sold"])
+    sell_now = len(lot_pnl_df[lot_pnl_df['Status'] == "🎯 SELL NOW"])
+    holding = len(lot_pnl_df[lot_pnl_df['Status'] == "⏳ Holding"])
+
+    col_st1, col_st2, col_st3 = st.columns(3)
+    with col_st1:
+        st.metric("✅ Fully Sold Lots", fully_sold)
+    with col_st2:
+        st.metric("🎯 Ready to Sell", sell_now)
+    with col_st3:
+        st.metric("⏳ Still Holding", holding)
+
+# ------------------------------------------------------------
 # PREDICTIONS
 # ------------------------------------------------------------
 st.divider()
@@ -679,7 +848,6 @@ with tab_sell:
     if portfolio['net_shares'] <= 0:
         st.warning("⚠️ No unsold holdings to sell.")
     else:
-        # Pre-fill with next lot if available
         default_lot_shares = next_lot['shares'] if next_lot else 1
         default_lot_price = next_lot['target_price'] if next_lot else (
             current_price if current_price else portfolio['avg_cost'] * 1.20
