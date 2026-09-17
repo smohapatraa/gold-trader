@@ -184,9 +184,7 @@ def delete_sell(sell_id):
 # PORTFOLIO CALCULATION — FIFO COST BASIS
 # ------------------------------------------------------------
 def compute_portfolio(buys_df, sells_df):
-    """
-    FIFO cost basis for realized profit + remaining lots.
-    """
+    """FIFO cost basis for realized profit + remaining lots."""
     buys = buys_df.copy()
     sells = sells_df.copy()
 
@@ -253,12 +251,7 @@ def compute_portfolio(buys_df, sells_df):
 # NEXT SELL LOT — 20% PROFIT, CHEAPEST FIRST
 # ------------------------------------------------------------
 def get_next_sell_lot(buys_df, sells_df, profit_pct=20):
-    """
-    Determine the next lot to sell:
-    - Get all unsold lots (after FIFO consumption of sells)
-    - Sort by BUY PRICE ascending (cheapest first)
-    - Each lot's target = buy_price × (1 + profit_pct/100)
-    """
+    """Find unsold lots, sort by price ascending, compute 20% target."""
     buys = buys_df.copy()
     sells = sells_df.copy()
 
@@ -276,6 +269,7 @@ def get_next_sell_lot(buys_df, sells_df, profit_pct=20):
             'price': float(row['price']),
         })
 
+    # FIFO consume but keep remaining lots only
     for _, sell_row in sells.sort_values('sell_date').iterrows():
         sell_shares = int(sell_row['shares'])
         remaining = sell_shares
@@ -301,11 +295,12 @@ def get_next_sell_lot(buys_df, sells_df, profit_pct=20):
 
 
 # ------------------------------------------------------------
-# LOT-WISE P&L (Realized + Unrealized separated)
+# LOT-WISE P&L — includes ALL lots (fully sold + holding)
 # ------------------------------------------------------------
 def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
     """
-    Compute per-lot profitability with SEPARATE Realized and Unrealized columns.
+    Per-lot P&L with SEPARATE Realized and Unrealized columns.
+    ALL lots appear — including fully sold ones.
     """
     buys = buys_df.copy()
     sells = sells_df.copy()
@@ -317,6 +312,7 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
         sells['sell_date'] = pd.to_datetime(sells['sell_date'], errors='coerce', dayfirst=True)
         sells = sells.sort_values('sell_date').reset_index(drop=True)
 
+    # Build lot tracker — ALL lots kept in list
     lots = []
     for _, row in buys.iterrows():
         lots.append({
@@ -329,20 +325,24 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
             'sold_shares': 0,
         })
 
+    # Consume lots FIFO — but DO NOT pop them
     for _, sell_row in sells.iterrows():
         sell_shares = int(sell_row['shares'])
         sell_price = float(sell_row['price'])
         remaining = sell_shares
 
-        while remaining > 0 and lots:
-            lot = lots[0]
+        for lot in lots:
+            if remaining <= 0:
+                break
+            if lot['remaining_shares'] <= 0:
+                continue
+
             if lot['remaining_shares'] <= remaining:
                 profit = lot['remaining_shares'] * (sell_price - lot['price'])
                 lot['realized_profit'] += profit
                 lot['sold_shares'] += lot['remaining_shares']
                 remaining -= lot['remaining_shares']
                 lot['remaining_shares'] = 0
-                lots.pop(0)
             else:
                 profit = remaining * (sell_price - lot['price'])
                 lot['realized_profit'] += profit
@@ -350,6 +350,7 @@ def compute_lot_wise_pnl(buys_df, sells_df, current_price=None, profit_pct=20):
                 lot['remaining_shares'] -= remaining
                 remaining = 0
 
+    # Build output — ALL lots included
     rows = []
     for lot in lots:
         cost_total = lot['orig_shares'] * lot['price']
@@ -489,7 +490,7 @@ def predict_next_day_open(gold_df, inr_df, etf_df):
 
 
 # ============================================================
-# MAIN UI — starts here
+# MAIN UI
 # ============================================================
 st.title("🥇 Gold Trading Portfolio & Prediction Dashboard")
 st.caption(f"🕐 Live prices updated {_ist_now()} IST · Data stored in Google Sheets")
@@ -503,14 +504,11 @@ with col_r1:
 
 st.divider()
 
-# ----- Load data -----
 buys_df = load_buys()
 sells_df = load_sells()
 
-# ----- Compute portfolio -----
 portfolio = compute_portfolio(buys_df, sells_df)
 
-# ----- Fetch live prices -----
 with st.spinner("Fetching live gold prices..."):
     bundle = fetch_gold_data()
 
@@ -648,7 +646,7 @@ else:
 # ------------------------------------------------------------
 st.divider()
 st.subheader("📋 Lot-Wise Profitability")
-st.caption("Realized (booked) · Unrealized (paper) · Total per lot")
+st.caption("Realized (booked) · Unrealized (paper) · Total per lot — includes fully sold lots")
 
 lot_pnl_df = compute_lot_wise_pnl(buys_df, sells_df, current_price, profit_pct=20)
 
@@ -658,6 +656,8 @@ if not lot_pnl_df.empty:
     total_pnl = lot_pnl_df['Total P&L (₹)'].sum()
     total_target_profit = lot_pnl_df['Target Profit (₹)'].sum()
     total_remaining_cost = lot_pnl_df['Remaining Cost (₹)'].sum()
+    total_sold_units = lot_pnl_df['Sold Units'].sum()
+    total_remaining_units = lot_pnl_df['Remaining Units'].sum()
 
     col_lp1, col_lp2, col_lp3, col_lp4, col_lp5 = st.columns(5)
 
@@ -675,6 +675,12 @@ if not lot_pnl_df.empty:
 
     with col_lp5:
         st.metric("🎯 Target Profit (20%)", f"₹{total_target_profit:,.2f}")
+
+    st.caption(
+        f"📦 Recon check — Sold Units: **{total_sold_units}** (should = {portfolio['total_shares_sold']}) · "
+        f"Remaining Units: **{total_remaining_units}** (should = {portfolio['net_shares']}) · "
+        f"Realized total: **₹{total_realized:,.2f}** (should = ₹{portfolio['total_profit']:,.2f})"
+    )
 
     def color_pnl(val):
         if isinstance(val, (int, float)):
